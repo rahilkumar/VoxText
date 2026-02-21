@@ -1,244 +1,215 @@
 import json
 import queue
-import threading
+import sys
 import time
+import threading
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
 
+import numpy as np
 import sounddevice as sd
 from vosk import Model, KaldiRecognizer
 
-
 # -------------------------
-# Config
+# Config (same as yours)
 # -------------------------
 MODEL_DIR = Path(__file__).parent / "models" / "vosk-model-en-us-0.22-lgraph"
 SAMPLE_RATE = 16000
 BLOCK_MS = 30
 BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_MS / 1000)
+DEVICE = None
+MIN_FINAL_CHARS = 1
 
-PREFERRED_MIC_SUBSTRING = "Adafruit"   # set None to skip auto-pick
-DEVICE = None                         # set to int to force device index
+# Duplicate protection
+last_final_text = ""
 
-MIN_FINAL_CHARS = 2
+audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=50)
 
-
-def pick_input_device(preferred_substring: str | None):
-    if not preferred_substring:
-        return None
+def pick_input_device(preferred_substring: str = "Adafruit"):
     devices = sd.query_devices()
+    candidates = []
     for i, d in enumerate(devices):
-        if d.get("max_input_channels", 0) > 0:
-            name = d.get("name", "")
-            if preferred_substring.lower() in name.lower():
-                return i
+        if d["max_input_channels"] > 0:
+            name = d["name"]
+            if preferred_substring and preferred_substring.lower() in name.lower():
+                candidates.append((i, name))
+    if candidates:
+        return candidates[0][0]
     return None
 
-
-def normalize_text(t: str) -> str:
-    return " ".join((t or "").lower().strip().split())
-
-
-def should_print(new_text: str, last_text: str) -> bool:
-    n = normalize_text(new_text)
-    l = normalize_text(last_text)
-    if not n:
-        return False
-    if n == l:
-        return False
-    # suppress near-duplicates: if one contains the other, keep longer
-    if l and (n in l or l in n):
-        return len(n) > len(l)
-    return True
+def audio_callback(indata, frames, time_info, status):
+    if status:
+        print(status, file=sys.stderr)
+    pcm16 = (indata[:, 0] * 32767).astype(np.int16)
+    try:
+        audio_q.put_nowait(pcm16)
+    except queue.Full:
+        pass
 
 
-class PushToTalkApp:
+class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("VoxText - Push to Talk (Offline Vosk)")
+        self.root.title("Voxtext - Vosk STT (Start/Stop)")
 
-        # UI
-        self.status_var = tk.StringVar(value="Idle (not listening)")
+        self.status_var = tk.StringVar(value="Stopped")
         self.btn_var = tk.StringVar(value="Start Listening")
 
-        self.status_label = ttk.Label(root, textvariable=self.status_var)
-        self.status_label.pack(padx=12, pady=(12, 6), anchor="w")
+        ttk.Label(root, textvariable=self.status_var).pack(padx=12, pady=(12, 6), anchor="w")
+        self.btn = ttk.Button(root, textvariable=self.btn_var, command=self.toggle)
+        self.btn.pack(padx=12, pady=6, fill="x")
 
-        self.toggle_btn = ttk.Button(root, textvariable=self.btn_var, command=self.toggle_listening)
-        self.toggle_btn.pack(padx=12, pady=6, fill="x")
+        self.out = tk.Text(root, height=14, wrap="word")
+        self.out.pack(padx=12, pady=(6, 12), fill="both", expand=True)
+        self.out.insert("end", "Click Start Listening → talk → Stop Listening to finalize.\n\n")
 
-        self.output = tk.Text(root, height=12, wrap="word")
-        self.output.pack(padx=12, pady=(6, 12), fill="both", expand=True)
-        self.output.insert("end", "Click Start Listening → talk → click Stop Listening to finalize.\n")
-
-        # Audio/recognizer state
+        # State
         self.listening = False
-        self.stream = None
-        self.audio_q: "queue.Queue[bytes]" = queue.Queue(maxsize=200)
+        self.stop_event = threading.Event()
 
         self.model = None
         self.rec = None
-        self.last_final = ""
 
-        # Worker thread control
-        self.worker_stop = threading.Event()
-        self.worker_thread = threading.Thread(target=self.worker_loop, daemon=True)
+        self.partial_last = ""
+        self.last_partial_print_t = 0.0
+        self.PARTIAL_THROTTLE_S = 0.08
 
-        self.init_vosk()
-        self.worker_thread.start()
+        self.stream = None
+        self.worker = None
 
-        # Clean shutdown
+        self.init_vosk_and_stream()
+
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def init_vosk(self):
+    def init_vosk_and_stream(self):
         if not MODEL_DIR.exists():
-            raise FileNotFoundError(f"Model not found: {MODEL_DIR}")
+            self.append(f"Model not found: {MODEL_DIR}\n")
+            self.append("Put the model folder under models/ and update MODEL_DIR.\n")
+            raise SystemExit(1)
+
+        dev = DEVICE
+        if dev is None:
+            dev = pick_input_device("Adafruit")
+
+        if dev is not None:
+            d = sd.query_devices(dev)
+            self.append(f"Using input device {dev}: {d['name']}\n")
+        else:
+            self.append("Using default input device\n")
 
         self.model = Model(str(MODEL_DIR))
         self.rec = KaldiRecognizer(self.model, SAMPLE_RATE)
+        self.rec.SetWords(True)
 
-        # CPU reducers
-        try:
-            self.rec.SetWords(False)
-        except Exception:
-            pass
-        try:
-            self.rec.SetMaxAlternatives(0)
-        except Exception:
-            pass
-
-    def audio_callback(self, indata, frames, time_info, status):
-        # Only queue audio while listening; otherwise discard
-        if not self.listening:
-            return
-        try:
-            self.audio_q.put_nowait(bytes(indata))
-        except queue.Full:
-            pass  # drop to keep latency stable
-
-    def start_stream(self):
-        dev = DEVICE
-        if dev is None:
-            dev = pick_input_device(PREFERRED_MIC_SUBSTRING)
-
-        # You can print device name into UI for confidence
-        try:
-            if dev is not None:
-                d = sd.query_devices(dev)
-                self.append_line(f"Using input device {dev}: {d['name']}")
-            else:
-                self.append_line("Using default input device")
-        except Exception:
-            pass
-
-        # Raw int16 stream = lower CPU and direct Vosk format
-        self.stream = sd.RawInputStream(
+        # Start audio stream immediately, but we'll ignore audio unless listening=True
+        self.stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             blocksize=BLOCK_SIZE,
             device=dev,
             channels=1,
-            dtype="int16",
-            callback=self.audio_callback,
+            dtype="float32",
+            callback=audio_callback,
         )
         self.stream.start()
 
-    def stop_stream(self):
-        if self.stream is not None:
-            try:
-                self.stream.stop()
-            except Exception:
-                pass
-            try:
-                self.stream.close()
-            except Exception:
-                pass
-            self.stream = None
+        # Start worker thread to process audio continuously
+        self.worker = threading.Thread(target=self.stt_loop, daemon=True)
+        self.worker.start()
 
-    def toggle_listening(self):
+    def append(self, msg: str):
+        self.out.insert("end", msg)
+        self.out.see("end")
+
+    def toggle(self):
+        global last_final_text
+
         if not self.listening:
-            # Start listening
+            # Start
             self.listening = True
-            self.status_var.set("Listening... (click Stop when done)")
+            self.status_var.set("Listening...")
             self.btn_var.set("Stop Listening")
-            self.append_line("▶ Listening started")
-            if self.stream is None:
-                self.start_stream()
-            # Reset recognizer for a fresh utterance
+
+            # Reset state so each press feels like a fresh utterance
+            last_final_text = ""
+            self.partial_last = ""
+            self.last_partial_print_t = 0.0
             self.rec.Reset()
+
+            self.append("▶ Listening started\n")
         else:
-            # Stop listening + finalize
+            # Stop and finalize
             self.listening = False
             self.status_var.set("Finalizing...")
             self.btn_var.set("Start Listening")
-            self.append_line("■ Listening stopped (finalizing...)")
 
-            # Drain any remaining queued audio quickly
-            time_limit = time.time() + 0.4
-            while time.time() < time_limit:
-                try:
-                    b = self.audio_q.get_nowait()
-                except queue.Empty:
-                    break
-                self.rec.AcceptWaveform(b)
-
-            # Finalize result
+            # Flush any final words
             try:
                 res = json.loads(self.rec.FinalResult())
                 text = (res.get("text") or "").strip()
             except Exception:
                 text = ""
 
-            if len(text) >= MIN_FINAL_CHARS and should_print(text, self.last_final):
-                self.last_final = text
-                self.append_line(f"FINAL: {text}")
+            if len(text) >= MIN_FINAL_CHARS and text != last_final_text:
+                last_final_text = text
+                self.append(f"FINAL: {text}\n\n")
             else:
-                self.append_line("FINAL: (nothing detected)")
+                self.append("FINAL: (nothing detected)\n\n")
 
-            self.status_var.set("Idle (not listening)")
+            self.status_var.set("Stopped")
+            self.append("■ Listening stopped\n")
 
-    def worker_loop(self):
-        """
-        Background worker: while listening, feed audio to recognizer.
-        We do NOT print partials. We just keep recognizer updated.
-        """
-        while not self.worker_stop.is_set():
+    def stt_loop(self):
+        global last_final_text
+
+        while not self.stop_event.is_set():
             try:
-                b = self.audio_q.get(timeout=0.1)
+                pcm16 = audio_q.get(timeout=0.1)
             except queue.Empty:
                 continue
 
-            # If user clicked stop, ignore queued audio
             if not self.listening:
                 continue
 
-            try:
-                self.rec.AcceptWaveform(b)
-            except Exception:
-                # Avoid crashing the UI if something weird happens
-                pass
+            data_bytes = pcm16.tobytes()
 
-    def append_line(self, line: str):
-        self.output.insert("end", line + "\n")
-        self.output.see("end")
+            if self.rec.AcceptWaveform(data_bytes):
+                res = json.loads(self.rec.Result())
+                text = (res.get("text") or "").strip()
+                if len(text) >= MIN_FINAL_CHARS and text != last_final_text:
+                    last_final_text = text
+                    # UI updates must happen on main thread
+                    self.root.after(0, lambda t=text: self.append(f"FINAL: {t}\n\n"))
+            else:
+                # show partial in UI (optional)
+                pres = json.loads(self.rec.PartialResult())
+                p = (pres.get("partial") or "").strip()
+
+                now = time.time()
+                if p and p != self.partial_last and (now - self.last_partial_print_t) >= self.PARTIAL_THROTTLE_S:
+                    self.partial_last = p
+                    self.last_partial_print_t = now
+                    self.root.after(0, lambda t=p: self.status_var.set(f"Listening... {t}"))
 
     def on_close(self):
-        self.worker_stop.set()
-        self.listening = False
-        self.stop_stream()
+        self.stop_event.set()
+        try:
+            if self.stream is not None:
+                self.stream.stop()
+                self.stream.close()
+        except Exception:
+            pass
         self.root.destroy()
 
 
 def main():
     root = tk.Tk()
-    # nicer default styling on Pi
     try:
         ttk.Style().theme_use("clam")
     except Exception:
         pass
-    app = PushToTalkApp(root)
+    App(root)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
