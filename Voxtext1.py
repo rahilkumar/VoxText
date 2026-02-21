@@ -8,31 +8,33 @@ import numpy as np
 import sounddevice as sd
 from vosk import Model, KaldiRecognizer
 
+# -------------------------
+# Config
+# -------------------------
 MODEL_DIR = Path(__file__).parent / "models" / "vosk-model-en-us-0.22-lgraph"
 SAMPLE_RATE = 16000
 BLOCK_MS = 30
 BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_MS / 1000)
-
 DEVICE = None
 
-# ---- Auto-gate settings (works across quiet → loud rooms) ----
-CALIBRATE_S = 1.2          # listen before starting recognition
-NOISE_ALPHA = 0.05         # noise floor smoothing (0.02–0.08)
-MIN_THR = 180              # absolute floor (prevents too-low thresholds)
-
-START_MULT = 2.2           # start speech if RMS > noise*START_MULT
-STOP_MULT  = 1.6           # stop speech when RMS < noise*STOP_MULT (hysteresis)
-
-MIN_SPEECH_MS = 60         # must be above threshold for this long to start
-HANGOVER_MS = 350          # keep feeding after speech falls below stop threshold
-FORCE_FINALIZE_SILENCE_MS = 450  # flush final if silence persists
-
-# ---- Output filtering ----
+# Output / filtering
 MIN_FINAL_CHARS = 2
 MIN_FINAL_WORDS = 1
-SUPPRESS_SIMILAR = True
 
-audio_q: "queue.Queue[bytes]" = queue.Queue(maxsize=120)
+# --- Auto noise gate (adaptive) ---
+CALIBRATE_S = 1.0            # start-up calibration (stay quiet)
+NOISE_ALPHA = 0.05           # how fast noise floor updates
+MIN_THR = 120                # absolute minimum threshold (prevents too-low)
+START_MULT = 2.0             # start speech when rms > noise*START_MULT
+STOP_MULT  = 1.4             # stop speech when rms < noise*STOP_MULT (hysteresis)
+MIN_SPEECH_MS = 60           # must be above threshold for this long to start
+HANGOVER_MS = 300            # keep feeding a bit after it drops below stop threshold
+FORCE_FINALIZE_SILENCE_MS = 350  # flush final after silence
+
+# Duplicate protection
+last_final_text = ""
+
+audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=80)
 
 def pick_input_device(preferred_substring: str = "Adafruit"):
     devices = sd.query_devices()
@@ -44,37 +46,40 @@ def pick_input_device(preferred_substring: str = "Adafruit"):
 def audio_callback(indata, frames, time_info, status):
     if status:
         print(status, file=sys.stderr)
+    pcm16 = (indata[:, 0] * 32767).astype(np.int16)
     try:
-        audio_q.put_nowait(bytes(indata))
+        audio_q.put_nowait(pcm16)
     except queue.Full:
         pass
 
-def rms_int16_bytes(b: bytes) -> float:
-    x = np.frombuffer(b, dtype=np.int16).astype(np.float32)
-    return float(np.sqrt(np.mean(x * x)))
+def rms_int16(x: np.ndarray) -> float:
+    xf = x.astype(np.float32)
+    return float(np.sqrt(np.mean(xf * xf)))
 
 def normalize_text(t: str) -> str:
     return " ".join(t.lower().strip().split())
 
-def is_new_final(new_text: str, last_text: str) -> bool:
+def is_new_final(new_text: str, old_text: str) -> bool:
     n = normalize_text(new_text)
-    l = normalize_text(last_text)
+    o = normalize_text(old_text)
     if not n:
         return False
-    if n == l:
+    if n == o:
         return False
-    if not SUPPRESS_SIMILAR or not l:
-        return True
-    if n in l or l in n:
-        return len(n) > len(l)
+    # suppress near-duplicates: keep longer if one contains the other
+    if o and (n in o or o in n):
+        return len(n) > len(o)
     return True
 
 def main():
+    global last_final_text
+
     if not MODEL_DIR.exists():
         print(f"Model not found: {MODEL_DIR}")
         sys.exit(1)
 
     dev = DEVICE if DEVICE is not None else pick_input_device("Adafruit")
+
     if dev is not None:
         d = sd.query_devices(dev)
         print(f"Using input device {dev}: {d['name']}")
@@ -83,10 +88,12 @@ def main():
 
     model = Model(str(MODEL_DIR))
     rec = KaldiRecognizer(model, SAMPLE_RATE)
+
+    # CPU reducers (keep recognition quality)
     rec.SetWords(False)
     rec.SetMaxAlternatives(0)
 
-    print("\n--- Voxtext: FINAL-only Offline STT (Auto noise gate) ---")
+    print("\n--- Voxtext: FINAL-only Streaming STT (Adaptive Noise Gate) ---")
     print(f"Calibrating for {CALIBRATE_S:.1f}s... stay quiet.\n")
 
     # Gate state
@@ -95,24 +102,22 @@ def main():
     hang_ms = 0
     silence_ms = 0
 
-    # Noise floor init from calibration
+    # Noise floor init
     noise_rms = None
     t_end = time.time() + CALIBRATE_S
 
-    last_final_text = ""
-
-    with sd.RawInputStream(
+    with sd.InputStream(
         samplerate=SAMPLE_RATE,
         blocksize=BLOCK_SIZE,
         device=dev,
         channels=1,
-        dtype="int16",
+        dtype="float32",
         callback=audio_callback,
     ):
         # Calibration phase
         while time.time() < t_end:
-            b = audio_q.get()
-            r = rms_int16_bytes(b)
+            pcm16 = audio_q.get()
+            r = rms_int16(pcm16)
             noise_rms = r if noise_rms is None else (1 - NOISE_ALPHA) * noise_rms + NOISE_ALPHA * r
 
         if noise_rms is None:
@@ -122,17 +127,17 @@ def main():
 
         try:
             while True:
-                b = audio_q.get()
-                r = rms_int16_bytes(b)
+                pcm16 = audio_q.get()
+                r = rms_int16(pcm16)
 
-                # Update noise floor ONLY when not in speech AND below start threshold
                 start_thr = max(MIN_THR, noise_rms * START_MULT)
                 stop_thr  = max(MIN_THR, noise_rms * STOP_MULT)
 
+                # Update noise floor only when not in speech and below start threshold
                 if (not in_speech) and (r < start_thr):
                     noise_rms = (1 - NOISE_ALPHA) * noise_rms + NOISE_ALPHA * r
 
-                # Decide speech / silence using hysteresis thresholds
+                # Hysteresis gate
                 if not in_speech:
                     if r >= start_thr:
                         above_ms += BLOCK_MS
@@ -143,7 +148,6 @@ def main():
                     else:
                         above_ms = 0
                 else:
-                    # in speech
                     if r < stop_thr:
                         hang_ms -= BLOCK_MS
                         silence_ms += BLOCK_MS
@@ -155,9 +159,11 @@ def main():
                         hang_ms = HANGOVER_MS
                         silence_ms = 0
 
+                data_bytes = pcm16.tobytes()
+
                 # Feed recognizer only during speech
                 if in_speech:
-                    if rec.AcceptWaveform(b):
+                    if rec.AcceptWaveform(data_bytes):
                         res = json.loads(rec.Result())
                         text = (res.get("text") or "").strip()
                         if len(text) >= MIN_FINAL_CHARS and len(text.split()) >= MIN_FINAL_WORDS:
@@ -165,7 +171,7 @@ def main():
                                 last_final_text = text
                                 print(text, flush=True)
 
-                # Force finalize after enough silence (makes FINAL appear quickly)
+                # Force finalize after brief silence (makes FINAL appear quickly)
                 if (not in_speech) and silence_ms >= FORCE_FINALIZE_SILENCE_MS:
                     res = json.loads(rec.FinalResult())
                     text = (res.get("text") or "").strip()
