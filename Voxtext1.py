@@ -8,33 +8,28 @@ import numpy as np
 import sounddevice as sd
 from vosk import Model, KaldiRecognizer
 
-# -------------------------
-# Config
-# -------------------------
 MODEL_DIR = Path(__file__).parent / "models" / "vosk-model-en-us-0.22-lgraph"
 SAMPLE_RATE = 16000
-
 BLOCK_MS = 30
 BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_MS / 1000)
 
-DEVICE = None  # set to int if you want
+DEVICE = None
 
-# ---- Noise / VAD gate tuning ----
-# Start here for a loud demo place: 500-1200 is common.
-RMS_THRESHOLD = 800
+# ---- Auto-gate settings (works across quiet → loud rooms) ----
+CALIBRATE_S = 1.2          # listen before starting recognition
+NOISE_ALPHA = 0.05         # noise floor smoothing (0.02–0.08)
+MIN_THR = 180              # absolute floor (prevents too-low thresholds)
 
-# Require a bit of "speech" before we start feeding Vosk (prevents random background hits)
-MIN_SPEECH_MS = 120
+START_MULT = 2.2           # start speech if RMS > noise*START_MULT
+STOP_MULT  = 1.6           # stop speech when RMS < noise*STOP_MULT (hysteresis)
 
-# After speech ends, keep feeding for a bit so we don't cut off trailing words
-HANGOVER_MS = 250
-
-# How often to update noise floor (only during non-speech)
-NOISE_UPDATE_ALPHA = 0.03  # lower = slower
+MIN_SPEECH_MS = 60         # must be above threshold for this long to start
+HANGOVER_MS = 350          # keep feeding after speech falls below stop threshold
+FORCE_FINALIZE_SILENCE_MS = 450  # flush final if silence persists
 
 # ---- Output filtering ----
-MIN_FINAL_CHARS = 3
-MIN_FINAL_WORDS = 2
+MIN_FINAL_CHARS = 2
+MIN_FINAL_WORDS = 1
 SUPPRESS_SIMILAR = True
 
 audio_q: "queue.Queue[bytes]" = queue.Queue(maxsize=120)
@@ -52,12 +47,11 @@ def audio_callback(indata, frames, time_info, status):
     try:
         audio_q.put_nowait(bytes(indata))
     except queue.Full:
-        pass  # drop to keep latency low
+        pass
 
-def rms_int16(x: np.ndarray) -> float:
-    # x: int16
-    xf = x.astype(np.float32)
-    return float(np.sqrt(np.mean(xf * xf)))
+def rms_int16_bytes(b: bytes) -> float:
+    x = np.frombuffer(b, dtype=np.int16).astype(np.float32)
+    return float(np.sqrt(np.mean(x * x)))
 
 def normalize_text(t: str) -> str:
     return " ".join(t.lower().strip().split())
@@ -71,7 +65,6 @@ def is_new_final(new_text: str, last_text: str) -> bool:
         return False
     if not SUPPRESS_SIMILAR or not l:
         return True
-    # If one contains the other, keep the longer one (prevents repeat bursts)
     if n in l or l in n:
         return len(n) > len(l)
     return True
@@ -90,21 +83,21 @@ def main():
 
     model = Model(str(MODEL_DIR))
     rec = KaldiRecognizer(model, SAMPLE_RATE)
+    rec.SetWords(False)
+    rec.SetMaxAlternatives(0)
 
-    # CPU reducers:
-    rec.SetWords(False)          # big CPU saver (don’t need word timestamps)
-    rec.SetMaxAlternatives(0)    # keep it simple
-
-    print("\n--- Voxtext: FINAL-only Offline STT (Vosk) ---")
-    print("Ctrl+C to stop.\n")
+    print("\n--- Voxtext: FINAL-only Offline STT (Auto noise gate) ---")
+    print(f"Calibrating for {CALIBRATE_S:.1f}s... stay quiet.\n")
 
     # Gate state
     in_speech = False
-    speech_ms = 0
+    above_ms = 0
     hang_ms = 0
+    silence_ms = 0
 
-    # Dynamic noise floor tracking (helps in changing environments)
-    noise_rms = RMS_THRESHOLD * 0.6  # initial guess
+    # Noise floor init from calibration
+    noise_rms = None
+    t_end = time.time() + CALIBRATE_S
 
     last_final_text = ""
 
@@ -116,49 +109,71 @@ def main():
         dtype="int16",
         callback=audio_callback,
     ):
+        # Calibration phase
+        while time.time() < t_end:
+            b = audio_q.get()
+            r = rms_int16_bytes(b)
+            noise_rms = r if noise_rms is None else (1 - NOISE_ALPHA) * noise_rms + NOISE_ALPHA * r
+
+        if noise_rms is None:
+            noise_rms = MIN_THR
+
+        print("Listening. Ctrl+C to stop.\n")
+
         try:
             while True:
-                data_bytes = audio_q.get()
-                chunk = np.frombuffer(data_bytes, dtype=np.int16)
+                b = audio_q.get()
+                r = rms_int16_bytes(b)
 
-                r = rms_int16(chunk)
+                # Update noise floor ONLY when not in speech AND below start threshold
+                start_thr = max(MIN_THR, noise_rms * START_MULT)
+                stop_thr  = max(MIN_THR, noise_rms * STOP_MULT)
 
-                # Update noise floor only when we're NOT in speech
+                if (not in_speech) and (r < start_thr):
+                    noise_rms = (1 - NOISE_ALPHA) * noise_rms + NOISE_ALPHA * r
+
+                # Decide speech / silence using hysteresis thresholds
                 if not in_speech:
-                    noise_rms = (1 - NOISE_UPDATE_ALPHA) * noise_rms + NOISE_UPDATE_ALPHA * r
-
-                # Adaptive threshold: base threshold OR (noise floor * factor)
-                # In loud places, noise floor rises; this helps ignore background.
-                adaptive_thr = max(RMS_THRESHOLD, noise_rms * 2.2)
-
-                is_loud = r >= adaptive_thr
-
-                if is_loud:
-                    speech_ms += BLOCK_MS
-                    if not in_speech and speech_ms >= MIN_SPEECH_MS:
-                        in_speech = True
-                        hang_ms = HANGOVER_MS
+                    if r >= start_thr:
+                        above_ms += BLOCK_MS
+                        if above_ms >= MIN_SPEECH_MS:
+                            in_speech = True
+                            hang_ms = HANGOVER_MS
+                            silence_ms = 0
+                    else:
+                        above_ms = 0
                 else:
-                    if in_speech:
+                    # in speech
+                    if r < stop_thr:
                         hang_ms -= BLOCK_MS
+                        silence_ms += BLOCK_MS
                         if hang_ms <= 0:
                             in_speech = False
-                            speech_ms = 0
+                            above_ms = 0
                             hang_ms = 0
                     else:
-                        speech_ms = 0
+                        hang_ms = HANGOVER_MS
+                        silence_ms = 0
 
-                # Only feed recognizer when we consider it speech (or hangover)
+                # Feed recognizer only during speech
                 if in_speech:
-                    if rec.AcceptWaveform(data_bytes):
+                    if rec.AcceptWaveform(b):
                         res = json.loads(rec.Result())
                         text = (res.get("text") or "").strip()
-
-                        # Basic quality gates to reduce garbage triggers
                         if len(text) >= MIN_FINAL_CHARS and len(text.split()) >= MIN_FINAL_WORDS:
                             if is_new_final(text, last_final_text):
                                 last_final_text = text
                                 print(text, flush=True)
+
+                # Force finalize after enough silence (makes FINAL appear quickly)
+                if (not in_speech) and silence_ms >= FORCE_FINALIZE_SILENCE_MS:
+                    res = json.loads(rec.FinalResult())
+                    text = (res.get("text") or "").strip()
+                    if len(text) >= MIN_FINAL_CHARS and len(text.split()) >= MIN_FINAL_WORDS:
+                        if is_new_final(text, last_final_text):
+                            last_final_text = text
+                            print(text, flush=True)
+                    silence_ms = 0
 
         except KeyboardInterrupt:
             print("\nStopping...")
