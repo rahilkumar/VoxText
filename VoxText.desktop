@@ -1,8 +1,14 @@
 [Desktop Entry]
 Name=VoxText
 Comment=Offline Speech To Text
-Exec=bash run.sh
-Icon=audio-input-microphone
-Terminal=false
 Type=Application
+Terminal=false
 Categories=Utility;
+
+# IMPORTANT: set working directory
+Path=/home/elplatanito/VoxText
+
+# IMPORTANT: use absolute Exec
+Exec=/bin/bash /home/elplatanito/VoxText/run.sh
+
+Icon=audio-input-microphone
