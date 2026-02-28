@@ -16,16 +16,16 @@ import customtkinter as ctk
 # -------------------------
 MODEL_DIR = Path(__file__).parent / "models" / "vosk-model-en-us-0.22-lgraph"
 BLOCK_MS = 30
-DEVICE = None          # set to int index if you want to force a device
+DEVICE = None          # set to int index if you want to force
 MIN_FINAL_CHARS = 1
 
-# UI colors (dark)
+# UI colors
 BG = "#0b0f14"
 CARD = "#111827"
 TEXT = "#e5e7eb"
 MUTED_RED = "#ef4444"
 LIVE_GREEN = "#22c55e"
-BORDER = "#1f2937"
+ACCENT = "#60a5fa"
 
 
 def pick_input_device(preferred_substring: str = "Adafruit"):
@@ -42,16 +42,17 @@ class VoxTextApp(ctk.CTk):
 
         # Window
         self.title("VoxText")
-        self.geometry("980x560")
+        self.geometry("900x520")
         self.minsize(820, 480)
 
         ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
         self.configure(fg_color=BG)
 
         # State
         self.listening = False
         self.stop_event = threading.Event()
-        self.audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=150)
+        self.audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=120)
 
         self.model = None
         self.rec = None
@@ -62,7 +63,7 @@ class VoxTextApp(ctk.CTk):
         self.last_partial_t = 0.0
         self.PARTIAL_THROTTLE_S = 0.08
 
-        # UI
+        # Build UI
         self._build_ui()
 
         # Init audio + worker
@@ -73,55 +74,68 @@ class VoxTextApp(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_ui(self):
-        # Main card container
-        container = ctk.CTkFrame(self, fg_color=CARD, corner_radius=28)
-        container.pack(fill="both", expand=True, padx=20, pady=20)
+        # Top bar
+        top = ctk.CTkFrame(self, fg_color=BG)
+        top.pack(fill="x", padx=18, pady=(18, 10))
 
-        # Header row: [circle] [Muted/Unmuted] [Transcript]
-        header = ctk.CTkFrame(container, fg_color=CARD, corner_radius=28)
-        header.pack(fill="x", padx=18, pady=(18, 10))
+        title = ctk.CTkLabel(top, text="VoxText", text_color=TEXT,
+                             font=ctk.CTkFont(size=24, weight="bold"))
+        title.pack(side="left")
 
-        # Mic circle button (top-left)
+        self.status_var = ctk.StringVar(value="Muted")
+        status = ctk.CTkLabel(top, textvariable=self.status_var, text_color="#9ca3af",
+                              font=ctk.CTkFont(size=14))
+        status.pack(side="right")
+
+        # Main layout: left controls, right transcript
+        main = ctk.CTkFrame(self, fg_color=BG)
+        main.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+
+        left = ctk.CTkFrame(main, fg_color=CARD, corner_radius=18)
+        left.pack(side="left", fill="y", padx=(0, 12))
+
+        right = ctk.CTkFrame(main, fg_color=CARD, corner_radius=18)
+        right.pack(side="right", fill="both", expand=True)
+
+        # Left panel content
+        ctk.CTkLabel(left, text="Microphone", text_color=TEXT,
+                     font=ctk.CTkFont(size=18, weight="bold")).pack(padx=18, pady=(18, 6), anchor="w")
+
+        ctk.CTkLabel(left, text="Tap the circle to mute/unmute.\nGreen = listening.",
+                     text_color="#9ca3af", justify="left").pack(padx=18, pady=(0, 14), anchor="w")
+
+        # Big circular button (approx circle)
         self.mic_btn = ctk.CTkButton(
-            header,
+            left,
             text="",
-            width=34,
-            height=34,
-            corner_radius=17,
+            width=140,
+            height=140,
+            corner_radius=70,
             fg_color=MUTED_RED,
             hover_color="#dc2626",
             command=self.toggle_listening
         )
-        self.mic_btn.pack(side="left", padx=(0, 10))
+        self.mic_btn.pack(padx=24, pady=12)
 
-        # Muted/Unmuted label
-        self.status_var = ctk.StringVar(value="Muted")
-        self.status_label = ctk.CTkLabel(
-            header,
-            textvariable=self.status_var,
-            text_color=MUTED_RED,
-            font=ctk.CTkFont(size=14, weight="bold")
-        )
-        self.status_label.pack(side="left", padx=(0, 18))
+        self.mic_label_var = ctk.StringVar(value="MUTED")
+        self.mic_label = ctk.CTkLabel(left, textvariable=self.mic_label_var,
+                                      text_color=TEXT, font=ctk.CTkFont(size=16, weight="bold"))
+        self.mic_label.pack(pady=(6, 18))
 
-        # Transcript title (left aligned)
-        ctk.CTkLabel(
-            header,
-            text="Transcript",
-            text_color=TEXT,
-            font=ctk.CTkFont(size=18, weight="bold")
-        ).pack(side="left")
+        self.partial_var = ctk.StringVar(value="…")
+        self.partial = ctk.CTkLabel(left, textvariable=self.partial_var, text_color=ACCENT,
+                                    wraplength=250, justify="left")
+        self.partial.pack(padx=18, pady=(0, 18), anchor="w")
 
-        # Transcript box (no pre-filled text)
-        self.textbox = ctk.CTkTextbox(
-            container,
-            fg_color="#0f172a",
-            text_color=TEXT,
-            corner_radius=18,
-            border_width=1,
-            border_color=BORDER
-        )
+        # Right panel: transcript
+        ctk.CTkLabel(right, text="Transcript", text_color=TEXT,
+                     font=ctk.CTkFont(size=18, weight="bold")).pack(padx=18, pady=(18, 10), anchor="w")
+
+        self.textbox = ctk.CTkTextbox(right, fg_color="#0f172a", text_color=TEXT,
+                                      corner_radius=14, border_width=1, border_color="#1f2937")
         self.textbox.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+
+        self.textbox.insert("end", "Tap the red circle to start.\n\n")
 
     def append_final(self, msg: str):
         self.textbox.insert("end", msg)
@@ -133,18 +147,15 @@ class VoxTextApp(ctk.CTk):
 
         dev = DEVICE if DEVICE is not None else pick_input_device("Adafruit")
 
-        # Use device native sample rate (more reliable on Pi/USB mics)
         if dev is not None:
             d = sd.query_devices(dev)
-            print(f"Using device {dev}: {d['name']}")
         else:
             d = sd.query_devices(sd.default.device[0])
-            print("Using default input device")
 
         native_sr = int(d["default_samplerate"])
         block_size = int(native_sr * BLOCK_MS / 1000)
 
-        # Vosk recognizer must match incoming sample rate
+        # Recognizer sample rate should match incoming audio
         self.model = Model(str(MODEL_DIR))
         self.rec = KaldiRecognizer(self.model, native_sr)
         self.rec.SetWords(True)
@@ -178,29 +189,30 @@ class VoxTextApp(ctk.CTk):
 
     def toggle_listening(self):
         if not self.listening:
-            # Start (unmute)
+            # start
             self.listening = True
             self.mic_btn.configure(fg_color=LIVE_GREEN, hover_color="#16a34a")
-            self.status_var.set("Unmuted")
-            self.status_label.configure(text_color=LIVE_GREEN)
+            self.mic_label_var.set("LIVE")
+            self.status_var.set("Listening…")
+            self.partial_var.set("Speak now…")
 
             self.last_final_text = ""
             self.partial_last = ""
             self.last_partial_t = 0.0
             self.rec.Reset()
 
-            # Clear any old queued chunks (fresh start)
             while True:
                 try:
                     self.audio_q.get_nowait()
                 except queue.Empty:
                     break
         else:
-            # Stop (mute) + finalize
+            # stop + finalize
             self.listening = False
             self.mic_btn.configure(fg_color=MUTED_RED, hover_color="#dc2626")
+            self.mic_label_var.set("MUTED")
             self.status_var.set("Muted")
-            self.status_label.configure(text_color=MUTED_RED)
+            self.partial_var.set("…")
 
             # Drain a little then finalize
             deadline = time.time() + 0.4
@@ -219,9 +231,9 @@ class VoxTextApp(ctk.CTk):
 
             if len(text) >= MIN_FINAL_CHARS and text != self.last_final_text:
                 self.last_final_text = text
-                self.after(0, lambda t=text: self.append_final(f"{t}\n\n"))
+                self.after(0, lambda t=text: self.append_final(f"FINAL: {t}\n\n"))
             else:
-                self.after(0, lambda: self.append_final("(nothing detected)\n\n"))
+                self.after(0, lambda: self.append_final("FINAL: (nothing detected)\n\n"))
 
     def stt_loop(self):
         while not self.stop_event.is_set():
@@ -240,11 +252,15 @@ class VoxTextApp(ctk.CTk):
                 text = (res.get("text") or "").strip()
                 if len(text) >= MIN_FINAL_CHARS and text != self.last_final_text:
                     self.last_final_text = text
-                    self.after(0, lambda t=text: self.append_final(f"{t}\n\n"))
+                    self.after(0, lambda t=text: self.append_final(f"FINAL: {t}\n\n"))
             else:
-                # Partial results are intentionally NOT shown in transcript
-                # (you asked to avoid showing pre-transcript/partial output)
-                pass
+                pres = json.loads(self.rec.PartialResult())
+                p = (pres.get("partial") or "").strip()
+                now = time.time()
+                if p and p != self.partial_last and (now - self.last_partial_t) >= self.PARTIAL_THROTTLE_S:
+                    self.partial_last = p
+                    self.last_partial_t = now
+                    self.after(0, lambda t=p: self.partial_var.set(t))
 
     def on_close(self):
         self.stop_event.set()
