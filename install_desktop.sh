@@ -6,57 +6,50 @@ APPS_DIR="$HOME/.local/share/applications"
 DESKTOP_SHORTCUT="$HOME/Desktop/VoxText.desktop"
 DESKTOP_FILE="$APPS_DIR/VoxText.desktop"
 
-echo "Setting up VoxText..."
-echo "App directory: $APP_DIR"
+echo "=============================="
+echo "Installing VoxText..."
+echo "=============================="
 
-# Install system packages
-echo "Installing system packages..."
+# Fix broken apt packages if any
+echo "Checking for broken packages..."
+sudo apt --fix-broken install -y || true
+
+echo "Installing system dependencies..."
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip portaudio19-dev libportaudio2 python3-tk python3-dev libopenblas-dev
 
-# Fix script permissions
+sudo apt install -y \
+python3 \
+python3-venv \
+python3-pip \
+libportaudio2 \
+python3-tk \
+git
+
+echo "Setting permissions..."
 chmod +x "$APP_DIR/run.sh" 2>/dev/null || true
-chmod +x "$APP_DIR/install_desktop.sh" 2>/dev/null || true
 
-# Create virtual environment if missing
+# Create venv
 if [ ! -d "$APP_DIR/.venv" ]; then
     echo "Creating virtual environment..."
     python3 -m venv "$APP_DIR/.venv"
 fi
 
-# Activate venv
-echo "Activating virtual environment..."
+echo "Activating environment..."
 source "$APP_DIR/.venv/bin/activate"
 
-# Upgrade pip tools
 echo "Upgrading pip..."
-python -m pip install --upgrade pip setuptools wheel
+pip install --upgrade pip
 
-# Install Python dependencies
-if [ -f "$APP_DIR/requirements.txt" ]; then
-    echo "Installing Python packages from requirements.txt..."
-    pip install -r "$APP_DIR/requirements.txt"
-else
-    echo "requirements.txt not found, installing default packages..."
-    pip install vosk sounddevice numpy customtkinter
-fi
+echo "Installing Python packages..."
+pip install \
+vosk \
+sounddevice \
+numpy \
+customtkinter
 
-# Ensure run.sh exists
-if [ ! -f "$APP_DIR/run.sh" ]; then
-    cat > "$APP_DIR/run.sh" <<'EOF'
-#!/bin/bash
-set -e
-cd "$(dirname "$0")"
-source .venv/bin/activate
-exec python Voxtext_app.py
-EOF
-    chmod +x "$APP_DIR/run.sh"
-fi
-
-# Create applications folder
+echo "Creating desktop launcher..."
 mkdir -p "$APPS_DIR"
 
-# Create launcher in applications menu
 cat > "$DESKTOP_FILE" <<EOF
 [Desktop Entry]
 Version=1.0
@@ -72,19 +65,19 @@ EOF
 
 chmod +x "$DESKTOP_FILE"
 
-# Copy launcher to desktop if desktop exists
-if [ -d "$HOME/Desktop" ]; then
-    cp "$DESKTOP_FILE" "$DESKTOP_SHORTCUT"
-    chmod +x "$DESKTOP_SHORTCUT" 2>/dev/null || true
-    gio set "$DESKTOP_SHORTCUT" metadata::trusted true 2>/dev/null || true
-fi
+# Copy to desktop
+cp "$DESKTOP_FILE" "$DESKTOP_SHORTCUT" 2>/dev/null || true
+chmod +x "$DESKTOP_SHORTCUT" 2>/dev/null || true
 
-# Trust application launcher where supported
+# Trust launcher (Raspberry Pi OS / GNOME)
 gio set "$DESKTOP_FILE" metadata::trusted true 2>/dev/null || true
+gio set "$DESKTOP_SHORTCUT" metadata::trusted true 2>/dev/null || true
 
-echo
-echo "VoxText setup complete."
-echo "Try launching from:"
-echo "  1) Desktop -> VoxText.desktop"
-echo "  2) Applications menu -> VoxText"
-echo "  3) Terminal -> $APP_DIR/run.sh"
+echo ""
+echo "=============================="
+echo "VoxText installation complete!"
+echo "=============================="
+echo ""
+echo "You can now launch VoxText from:"
+echo "Desktop → VoxText"
+echo ""
