@@ -12,7 +12,7 @@ echo "App directory: $APP_DIR"
 # Install system packages
 echo "Installing system packages..."
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip portaudio19-dev python3-tk python3-dev libopenblas-dev
+sudo apt install -y python3 python3-venv python3-pip portaudio19-dev libportaudio2 python3-tk python3-dev libopenblas-dev
 
 # Fix script permissions
 chmod +x "$APP_DIR/run.sh" 2>/dev/null || true
